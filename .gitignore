@@ -1,0 +1,38 @@
+# Build directory
+build/
+
+# Compiled object files
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+
+# Executables
+*.exe
+*.out
+*.app
+face_mood_detection
+
+# Log files
+*.log
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*~
+
+# Dependency directories
+external/ 
