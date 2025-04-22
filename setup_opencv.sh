@@ -3,7 +3,7 @@
 # Exit on error
 set -e
 
-echo "Starting OpenCV with Face module installation for Raspberry Pi"
+echo "Starting OpenCV with Face module installation for Ubuntu"
 
 # Update and install dependencies
 echo "Updating system and installing dependencies..."
@@ -18,6 +18,10 @@ sudo apt-get install -y libgdk-pixbuf2.0-dev libpango1.0-dev
 sudo apt-get install -y libgtk2.0-dev libgtk-3-dev
 sudo apt-get install -y libatlas-base-dev gfortran
 sudo apt-get install -y python3-dev
+# Ubuntu-specific packages
+sudo apt-get install -y libeigen3-dev
+sudo apt-get install -y libopenblas-dev
+sudo apt-get install -y libcanberra-gtk-module
 
 # Create a directory for OpenCV build
 mkdir -p ~/opencv_build
@@ -28,7 +32,7 @@ echo "Cloning OpenCV repositories..."
 git clone https://github.com/opencv/opencv.git
 git clone https://github.com/opencv/opencv_contrib.git
 
-# Checkout a stable version (4.5.5 is a good balance between features and stability for Pi)
+# Checkout a stable version (4.5.5 is a good balance between features and stability)
 cd opencv
 git checkout 4.5.5
 cd ../opencv_contrib
@@ -39,23 +43,36 @@ cd ..
 mkdir -p opencv/build
 cd opencv/build
 
+# Check for CUDA support
+if [ -x "$(command -v nvcc)" ]; then
+    echo "CUDA found, enabling GPU acceleration..."
+    CUDA_OPTIONS="-D WITH_CUDA=ON \
+                 -D OPENCV_DNN_CUDA=ON \
+                 -D ENABLE_FAST_MATH=1 \
+                 -D CUDA_FAST_MATH=1 \
+                 -D WITH_CUBLAS=1"
+else
+    echo "CUDA not found, building without GPU acceleration..."
+    CUDA_OPTIONS="-D WITH_CUDA=OFF"
+fi
+
 # Configure OpenCV build with face module
 echo "Configuring OpenCV build with face module..."
 cmake -D CMAKE_BUILD_TYPE=RELEASE \
       -D CMAKE_INSTALL_PREFIX=/usr/local \
       -D OPENCV_EXTRA_MODULES_PATH=../../opencv_contrib/modules \
       -D ENABLE_NEON=ON \
-      -D ENABLE_VFPV3=ON \
       -D BUILD_TESTS=OFF \
       -D INSTALL_PYTHON_EXAMPLES=OFF \
       -D OPENCV_ENABLE_NONFREE=ON \
-      -D CMAKE_SHARED_LINKER_FLAGS=-latomic \
-      -D BUILD_EXAMPLES=OFF ..
+      -D BUILD_EXAMPLES=OFF \
+      -D WITH_TBB=ON \
+      -D WITH_OPENMP=ON \
+      -D BUILD_opencv_dnn=ON \
+      $CUDA_OPTIONS ..
 
 # Determine number of CPU cores for parallel build
-# For Raspberry Pi, it's better to use fewer cores to avoid running out of memory
 NUM_CORES=$(nproc)
-NUM_CORES=$((NUM_CORES < 4 ? NUM_CORES : 3))
 echo "Building with $NUM_CORES cores..."
 
 # Build OpenCV

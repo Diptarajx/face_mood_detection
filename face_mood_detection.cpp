@@ -1,4 +1,6 @@
 #include <opencv2/opencv.hpp>
+#include <opencv2/face.hpp>
+#include <opencv2/dnn.hpp>
 #include <iostream>
 #include <string>
 #include <chrono>
@@ -9,6 +11,15 @@
 #include <iomanip>
 #include <ctime>
 #include <filesystem>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+
+// For OpenMP parallel processing
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 using namespace cv;
 using namespace std;
@@ -24,12 +35,12 @@ struct Config {
     bool debug_mode = false;
     bool record_video = false;
     string video_output = "output.mp4";
-    double detection_confidence = 4.0; // Min neighbors for face detection
-    Size min_face_size = Size(30, 30);
+    double detection_confidence = 3.0; // Reduced for better detection sensitivity
+    Size min_face_size = Size(60, 60); // Increased minimum face size for better quality
     bool process_every_frame = false;
     bool show_fps = true;
-    string emotion_model_path = "emotion_ferplus_v1.onnx"; // Path to emotion recognition model
-    bool use_ml_emotion = true; // Flag to use ML-based emotion detection
+    string emotion_model_path = (fs::current_path() / "emotion_ferplus_v2.onnx").string(); // Use absolute path from current directory
+    bool use_ml_emotion = true; // Default to using ML-based detection
 };
 
 // Logger class for professional logging
@@ -131,7 +142,7 @@ private:
     bool using_calibration = false;
 
 public:
-    MoodDetector(Logger& log, bool debug = false, const string& model_path = "emotion_ferplus_v1.onnx", bool use_ml_emotion = true) 
+    MoodDetector(Logger& log, bool debug = false, const string& model_path = "emotion_ferplus_v2.onnx", bool use_ml_emotion = true) 
         : logger(log), debug_mode(debug), model_loaded(false), use_ml(use_ml_emotion) {
         
         // Initialize HOG parameters optimized for faces
@@ -280,9 +291,8 @@ public:
         Mat right_half = gray_face(Rect(32, 0, 32, 64));
         
         Scalar mean_left, stddev_left;
-        meanStdDev(left_half, mean_left, stddev_left);
-        
         Scalar mean_right, stddev_right;
+        meanStdDev(left_half, mean_left, stddev_left);
         meanStdDev(right_half, mean_right, stddev_right);
         
         float face_symmetry = abs(mean_left[0] - mean_right[0]);
@@ -292,9 +302,8 @@ public:
         Mat lower_mouth = mouth_region(Rect(8, 8, 16, 8));
         
         Scalar mean_upper, stddev_upper;
-        meanStdDev(upper_mouth, mean_upper, stddev_upper);
-        
         Scalar mean_lower, stddev_lower;
+        meanStdDev(upper_mouth, mean_upper, stddev_upper);
         meanStdDev(lower_mouth, mean_lower, stddev_lower);
         
         float smile_indicator = mean_lower[0] - mean_upper[0] + (stddev_lower[0] - stddev_upper[0]) * 2.0f;
@@ -623,22 +632,21 @@ public:
         vector<float> hog_features;
         hog.compute(gray_face, hog_features);
         
-        // Calculate mean and standard deviation of pixel values in different face regions
+        // Pre-allocate regions for better performance
         Mat mouth_region = gray_face(Rect(16, 40, 32, 16));  // Lower part of face
         Mat left_eye_region = gray_face(Rect(12, 16, 16, 8));  // Left eye region
         Mat right_eye_region = gray_face(Rect(36, 16, 16, 8)); // Right eye region
         Mat forehead_region = gray_face(Rect(16, 4, 32, 12));  // Forehead region
         
+        // Calculate mean and standard deviation for all regions at once
         Scalar mean_mouth, stddev_mouth;
-        meanStdDev(mouth_region, mean_mouth, stddev_mouth);
-        
         Scalar mean_eye_left, stddev_eye_left;
-        meanStdDev(left_eye_region, mean_eye_left, stddev_eye_left);
-        
         Scalar mean_eye_right, stddev_eye_right;
-        meanStdDev(right_eye_region, mean_eye_right, stddev_eye_right);
-        
         Scalar mean_forehead, stddev_forehead;
+        
+        meanStdDev(mouth_region, mean_mouth, stddev_mouth);
+        meanStdDev(left_eye_region, mean_eye_left, stddev_eye_left);
+        meanStdDev(right_eye_region, mean_eye_right, stddev_eye_right);
         meanStdDev(forehead_region, mean_forehead, stddev_forehead);
         
         // Calculate face brightness
@@ -650,9 +658,8 @@ public:
         Mat right_half = gray_face(Rect(32, 0, 32, 64));
         
         Scalar mean_left, stddev_left;
-        meanStdDev(left_half, mean_left, stddev_left);
-        
         Scalar mean_right, stddev_right;
+        meanStdDev(left_half, mean_left, stddev_left);
         meanStdDev(right_half, mean_right, stddev_right);
         
         float face_symmetry = abs(mean_left[0] - mean_right[0]);
@@ -662,9 +669,8 @@ public:
         Mat lower_mouth = mouth_region(Rect(8, 8, 16, 8));
         
         Scalar mean_upper, stddev_upper;
-        meanStdDev(upper_mouth, mean_upper, stddev_upper);
-        
         Scalar mean_lower, stddev_lower;
+        meanStdDev(upper_mouth, mean_upper, stddev_upper);
         meanStdDev(lower_mouth, mean_lower, stddev_lower);
         
         float smile_indicator = mean_lower[0] - mean_upper[0] + (stddev_lower[0] - stddev_upper[0]) * 2.0f;
@@ -703,46 +709,46 @@ public:
             logger.debug("Eye openness: " + to_string(eye_openness));
         }
         
-        // Start with a moderate neutral baseline (not too high)
-        emotion_confidence["Neutral"] = 0.75f;
+        // Start with a lower neutral baseline to allow other emotions to be detected more easily
+        emotion_confidence["Neutral"] = 0.65f;
         
         // Happy detection (based on smile indicator)
-        // Lower the threshold for smile detection
-        if (smile_indicator > 30.0f || gradient_smile > 10.0f) {
-            float happy_conf = 0.5f;
-            if (smile_indicator > 50.0f) happy_conf += 0.2f;
-            if (gradient_smile > 20.0f) happy_conf += 0.1f;
-            emotion_confidence["Happy"] = min(happy_conf, 0.9f);
-            emotion_confidence["Neutral"] = max(0.2f, emotion_confidence["Neutral"] - 0.3f);
+        if (smile_indicator > 25.0f || gradient_smile > 8.0f) {  // More sensitive thresholds
+            float happy_conf = 0.6f;  // Higher base confidence
+            if (smile_indicator > 40.0f) happy_conf += 0.25f;
+            if (gradient_smile > 15.0f) happy_conf += 0.15f;
+            emotion_confidence["Happy"] = min(happy_conf, 0.95f);
+            emotion_confidence["Neutral"] = max(0.15f, emotion_confidence["Neutral"] - 0.4f);
         }
         
         // Sad detection (negative smile indicator and higher forehead activity)
-        if (smile_indicator < -15.0f || gradient_smile < -5.0f) {
-            float sad_conf = 0.5f;
-            if (smile_indicator < -25.0f) sad_conf += 0.15f;
-            if (gradient_smile < -15.0f) sad_conf += 0.1f;
-            emotion_confidence["Sad"] = min(sad_conf, 0.85f);
-            emotion_confidence["Neutral"] = max(0.3f, emotion_confidence["Neutral"] - 0.25f);
+        if (smile_indicator < -12.0f || gradient_smile < -4.0f) {  // More sensitive thresholds
+            float sad_conf = 0.55f;  // Higher base confidence
+            if (smile_indicator < -20.0f) sad_conf += 0.2f;
+            if (gradient_smile < -12.0f) sad_conf += 0.15f;
+            if (stddev_forehead[0] > 40.0f) sad_conf += 0.1f;  // Consider forehead activity
+            emotion_confidence["Sad"] = min(sad_conf, 0.9f);
+            emotion_confidence["Neutral"] = max(0.2f, emotion_confidence["Neutral"] - 0.35f);
         }
         
         // Angry detection (face asymmetry, negative smile, high forehead activity)
-        if (face_symmetry > 25.0f && (smile_indicator < -10.0f || gradient_smile < -5.0f) && 
-            stddev_forehead[0] > 45.0f) {
-            float angry_conf = 0.45f;
-            if (face_symmetry > 35.0f) angry_conf += 0.15f;
-            if (stddev_forehead[0] > 55.0f) angry_conf += 0.15f;
-            emotion_confidence["Angry"] = min(angry_conf, 0.85f);
-            emotion_confidence["Neutral"] = max(0.25f, emotion_confidence["Neutral"] - 0.3f);
+        if (face_symmetry > 20.0f && (smile_indicator < -8.0f || gradient_smile < -4.0f) && 
+            stddev_forehead[0] > 40.0f) {  // More sensitive thresholds
+            float angry_conf = 0.5f;  // Higher base confidence
+            if (face_symmetry > 30.0f) angry_conf += 0.2f;
+            if (stddev_forehead[0] > 50.0f) angry_conf += 0.2f;
+            emotion_confidence["Angry"] = min(angry_conf, 0.9f);
+            emotion_confidence["Neutral"] = max(0.2f, emotion_confidence["Neutral"] - 0.35f);
         }
         
         // Surprised detection (high eye and mouth stddev)
-        if ((stddev_eye_left[0] > 60.0f && stddev_eye_right[0] > 60.0f) || 
-            (eye_openness > 0.5f && stddev_mouth[0] > 65.0f)) {
-            float surprised_conf = 0.55f;
-            if (stddev_eye_left[0] > 65.0f && stddev_eye_right[0] > 65.0f) surprised_conf += 0.15f;
-            if (stddev_mouth[0] > 70.0f) surprised_conf += 0.1f;
-            emotion_confidence["Surprised"] = min(surprised_conf, 0.85f);
-            emotion_confidence["Neutral"] = max(0.3f, emotion_confidence["Neutral"] - 0.3f);
+        if ((stddev_eye_left[0] > 55.0f && stddev_eye_right[0] > 55.0f) || 
+            (eye_openness > 0.45f && stddev_mouth[0] > 60.0f)) {  // More sensitive thresholds
+            float surprised_conf = 0.6f;  // Higher base confidence
+            if (stddev_eye_left[0] > 60.0f && stddev_eye_right[0] > 60.0f) surprised_conf += 0.2f;
+            if (stddev_mouth[0] > 65.0f) surprised_conf += 0.15f;
+            emotion_confidence["Surprised"] = min(surprised_conf, 0.9f);
+            emotion_confidence["Neutral"] = max(0.25f, emotion_confidence["Neutral"] - 0.35f);
         }
         
         // Tired detection (low eye stddev, overall low contrast)
@@ -827,6 +833,13 @@ public:
 // Initialize static member
 bool MoodDetector::model_load_attempted = false;
 
+// Add these constants at the top of the file
+const int RPI_MAX_FRAME_WIDTH = 640;  // Reduced resolution for RPi
+const int RPI_MAX_FRAME_HEIGHT = 480;
+const int RPI_SKIP_FRAMES = 3;        // Increased frame skipping for RPi
+const int RPI_MIN_FACE_SIZE = 50;     // Minimum face size for RPi
+const int RPI_MAX_FACE_SIZE = 300;    // Maximum face size for RPi
+
 // Parse command line arguments
 void parseCommandLine(int argc, char** argv, Config& config, Logger& logger) {
     for (int i = 1; i < argc; i++) {
@@ -893,6 +906,69 @@ void parseCommandLine(int argc, char** argv, Config& config, Logger& logger) {
     }
 }
 
+// Check for CUDA support
+bool hasCUDASupport() {
+    int cuda_devices = getCudaEnabledDeviceCount();
+    if (cuda_devices > 0) {
+        // Try to set the default CUDA device
+        try {
+            cuda::setDevice(0);
+            return true;
+        } catch (const Exception& e) {
+            cerr << "CUDA error: " << e.what() << endl;
+            return false;
+        }
+    }
+    return false;
+}
+
+// Parallel processing queue for face analysis
+class FaceProcessingQueue {
+private:
+    queue<pair<Mat, Rect>> face_queue;
+    mutex queue_mutex;
+    condition_variable condition;
+    bool stop_signal = false;
+    
+public:
+    void push(const Mat& frame, const Rect& face) {
+        unique_lock<mutex> lock(queue_mutex);
+        face_queue.push({frame.clone(), face});
+        condition.notify_one();
+    }
+    
+    bool pop(Mat& frame, Rect& face) {
+        unique_lock<mutex> lock(queue_mutex);
+        condition.wait(lock, [this] { return !face_queue.empty() || stop_signal; });
+        
+        if (stop_signal && face_queue.empty())
+            return false;
+            
+        auto item = face_queue.front();
+        face_queue.pop();
+        frame = item.first;
+        face = item.second;
+        return true;
+    }
+    
+    void stop() {
+        unique_lock<mutex> lock(queue_mutex);
+        stop_signal = true;
+        condition.notify_all();
+    }
+    
+    bool empty() {
+        unique_lock<mutex> lock(queue_mutex);
+        return face_queue.empty();
+    }
+    
+    void clear() {
+        unique_lock<mutex> lock(queue_mutex);
+        queue<pair<Mat, Rect>> empty;
+        swap(face_queue, empty);
+    }
+};
+
 // Main program
 int main(int argc, char** argv) {
     // Create config with default values
@@ -943,9 +1019,13 @@ int main(int argc, char** argv) {
         return -1;
     }
     
-    // Set optimal resolution - 640x480 is a good balance for performance
-    cap.set(CAP_PROP_FRAME_WIDTH, 640);
-    cap.set(CAP_PROP_FRAME_HEIGHT, 480);
+    // Optimize camera settings for Raspberry Pi
+    if (config.camera_id == "pi") {
+        cap.set(cv::CAP_PROP_FRAME_WIDTH, RPI_MAX_FRAME_WIDTH);
+        cap.set(cv::CAP_PROP_FRAME_HEIGHT, RPI_MAX_FRAME_HEIGHT);
+        cap.set(cv::CAP_PROP_FPS, 15);  // Reduced FPS for RPi
+        cap.set(cv::CAP_PROP_BUFFERSIZE, 1);  // Minimize buffer size
+    }
     
     // Get actual camera resolution
     int cam_width = cap.get(CAP_PROP_FRAME_WIDTH);
@@ -990,11 +1070,44 @@ int main(int argc, char** argv) {
     double inv_scale = 1.0 / scale_factor;
     bool process_this_frame = true;
     
+    // Frame skipping parameters
+    const int SKIP_FRAMES = 4;  // Process every 4th frame for better performance
+    int frame_counter = 0;
+    const int MIN_FPS_THRESHOLD = 15;  // Minimum FPS before reducing processing
+    const int MAX_FPS_THRESHOLD = 30;  // Maximum FPS before increasing processing
+    
+    // Pre-allocate matrices for better performance
+    Mat debug_face;
+    Mat face_roi;
+    Rect safe_face;
+    Mat equalized;
+    
+    // Mood detection optimization
+    const int MOOD_CACHE_SIZE = 10;  // Number of frames to cache mood results
+    map<Rect, vector<pair<string, float>>> mood_cache;  // Cache for mood detection results
+    map<Rect, int> mood_cache_counter;  // Counter for each face's cache
+    
     // Performance metrics
     int frame_count = 0;
     int detection_count = 0;
     auto start_time = chrono::steady_clock::now();
     double fps = 0.0;
+    bool adaptive_processing = true;
+    
+    // Face tracking variables
+    vector<Rect> prev_faces;
+    vector<Rect> tracked_faces;
+    const int TRACKING_THRESHOLD = 30;  // Pixels to consider as same face
+    
+    // Display optimization
+    const int DISPLAY_UPDATE_INTERVAL = 30;  // Update display every 30ms
+    auto last_display_update = chrono::steady_clock::now();
+    bool should_update_display = true;
+    
+    // Memory management
+    const int MAX_CACHE_ENTRIES = 100;  // Maximum number of faces to cache
+    const int CLEANUP_INTERVAL = 1000;  // Cleanup cache every 1000 frames
+    int cleanup_counter = 0;
     
     // Create windows
     namedWindow("Face and Mood Detection", WINDOW_NORMAL);
@@ -1039,7 +1152,7 @@ int main(int argc, char** argv) {
             video_writer.write(frame);
         }
         
-        // Update FPS calculation
+        // Update FPS calculation every 10 frames
         frame_count++;
         if (frame_count >= 10) {
             auto end_time = chrono::steady_clock::now();
@@ -1048,26 +1161,86 @@ int main(int argc, char** argv) {
             start_time = end_time;
         }
         
+        // Frame skipping logic with adaptive processing
+        frame_counter++;
+        if (adaptive_processing) {
+            if (fps < MIN_FPS_THRESHOLD) {
+                SKIP_FRAMES = min(SKIP_FRAMES + 1, 6);  // Increase skip frames if FPS is low
+            } else if (fps > MAX_FPS_THRESHOLD) {
+                SKIP_FRAMES = max(SKIP_FRAMES - 1, 2);  // Decrease skip frames if FPS is high
+            }
+        }
+        
+        if (frame_counter % SKIP_FRAMES != 0) {
+            // Display the frame without processing
+            auto current_time = chrono::steady_clock::now();
+            auto time_since_last_update = chrono::duration_cast<chrono::milliseconds>(current_time - last_display_update).count();
+            
+            if (time_since_last_update >= DISPLAY_UPDATE_INTERVAL) {
+                imshow("Face and Mood Detection", frame);
+                last_display_update = current_time;
+            }
+            continue;
+        }
+        
         // Process this frame or skip based on configuration
         if (process_this_frame || config.process_every_frame) {
-            // Resize frame for faster processing
-            resize(frame, small_frame, Size(), scale_factor, scale_factor);
+            // Start GPU processing
+            Mat gpu_frame;
+            bool using_gpu = false;
             
-            // Convert to grayscale for face detection (faster)
-            cvtColor(small_frame, gray, COLOR_BGR2GRAY);
+            if (hasCUDASupport()) {
+                using_gpu = true;
+                gpu_frame.upload(frame);
+                // Resize frame for faster processing (on GPU if available)
+                cuda::resize(gpu_frame, gpu_frame, Size(), scale_factor, scale_factor);
+                // Convert to grayscale for face detection (faster)
+                cuda::cvtColor(gpu_frame, gray_gpu, COLOR_BGR2GRAY);
+                // Download only when needed
+                gray_gpu.download(gray);
+            } else {
+                // CPU fallback
+                resize(frame, small_frame, Size(), scale_factor, scale_factor);
+                cvtColor(small_frame, gray, COLOR_BGR2GRAY);
+            }
             
             // Equalize histogram for better detection in varying lighting
-            equalizeHist(gray, gray);
+            equalizeHist(gray, equalized);
             
             // Clear previous detections
             faces.clear();
             
-            // Detect faces with optimized parameters
-            face_cascade.detectMultiScale(gray, faces, 
-                                         1.1,      // Scale factor
-                                         config.detection_confidence,  // Min neighbors (configurable)
-                                         0,        // Flags
-                                         config.min_face_size); // Min face size (configurable)
+            // Optimize face detection parameters for Raspberry Pi
+            face_cascade.detectMultiScale(
+                gray,
+                faces,
+                1.1,  // Scale factor
+                3,    // Minimum neighbors
+                0,    // Flags
+                cv::Size(RPI_MIN_FACE_SIZE, RPI_MIN_FACE_SIZE),
+                cv::Size(RPI_MAX_FACE_SIZE, RPI_MAX_FACE_SIZE)
+            );
+            
+            // Face tracking
+            if (!prev_faces.empty()) {
+                tracked_faces.clear();
+                for (const Rect& face : faces) {
+                    bool found_match = false;
+                    for (const Rect& prev_face : prev_faces) {
+                        if (abs(face.x - prev_face.x) < TRACKING_THRESHOLD &&
+                            abs(face.y - prev_face.y) < TRACKING_THRESHOLD) {
+                            tracked_faces.push_back(face);
+                            found_match = true;
+                            break;
+                        }
+                    }
+                    if (!found_match) {
+                        tracked_faces.push_back(face);
+                    }
+                }
+                faces = tracked_faces;
+            }
+            prev_faces = faces;
             
             detection_count += faces.size();
             
@@ -1077,48 +1250,88 @@ int main(int argc, char** argv) {
         }
         process_this_frame = !process_this_frame;
         
-        // Process each face
-        for (const Rect& small_face : faces) {
+        // Process faces in parallel if OpenMP is available
+        #pragma omp parallel for if(faces.size() > 1) num_threads(min(static_cast<int>(faces.size()), 4))
+        for (size_t i = 0; i < faces.size(); i++) {
+            const Rect& small_face = faces[i];
+            
             // Scale coordinates back to original size
             Rect face(cvRound(small_face.x * inv_scale),
                       cvRound(small_face.y * inv_scale),
                       cvRound(small_face.width * inv_scale),
                       cvRound(small_face.height * inv_scale));
             
-            // Draw rectangle around the face
-            rectangle(frame, face, Scalar(0, 255, 0), 2);
+            #pragma omp critical
+            {
+                // Draw rectangle around the face
+                rectangle(frame, face, Scalar(0, 255, 0), 2);
+            }
             
             // Extract face region for mood detection
-            Rect safe_face = face & Rect(0, 0, frame.cols, frame.rows); // Ensure within image bounds
-            if (safe_face.width > 0 && safe_face.height > 0) {
-                Mat face_roi = frame(safe_face);
+            Rect safe_face_local = face & Rect(0, 0, frame.cols, frame.rows); // Ensure within image bounds
+            if (safe_face_local.width > 0 && safe_face_local.height > 0) {
+                Mat face_roi_local = frame(safe_face_local).clone(); // Clone to avoid race conditions
                 
-                // Create debug output if needed
-                Mat debug_face;
+                // Check mood cache
+                string mood;
+                float confidence;
+                bool use_cache = false;
                 
-                // Detect mood
-                string mood = mood_detector.detectMood(face_roi, debug_face);
-                Scalar mood_color = mood_detector.getEmotionColor(mood);
-                float confidence = mood_detector.getCurrentConfidence();
-                
-                // Display the mood with appropriate color
-                putText(frame, mood, Point(face.x, face.y - 10),
-                        FONT_HERSHEY_SIMPLEX, 0.7, mood_color, 2);
-                
-                // Display confidence
-                string conf_text = "Conf: " + to_string(int(confidence * 100)) + "%";
-                putText(frame, conf_text, Point(face.x, face.y + face.height + 20),
-                        FONT_HERSHEY_SIMPLEX, 0.5, mood_color, 1);
-                
-                // Show calibration status if active
-                if (mood_detector.isUsingCalibration()) {
-                    putText(frame, "Calibrated", Point(face.x, face.y - 30),
-                            FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 255, 0), 1);
+                #pragma omp critical
+                {
+                    if (mood_cache.find(safe_face_local) != mood_cache.end()) {
+                        auto& cache = mood_cache[safe_face_local];
+                        if (!cache.empty()) {
+                            mood = cache.back().first;
+                            confidence = cache.back().second;
+                            use_cache = true;
+                        }
+                    }
                 }
                 
-                // Display debug view if enabled
-                if (config.debug_mode && !debug_face.empty()) {
-                    imshow("Debug View", debug_face);
+                if (!use_cache) {
+                    // Detect mood
+                    Mat debug_face_local;
+                    mood = mood_detector.detectMood(face_roi_local, debug_face_local);
+                    confidence = mood_detector.getCurrentConfidence();
+                    
+                    #pragma omp critical
+                    {
+                        // Update cache
+                        mood_cache[safe_face_local].push_back({mood, confidence});
+                        mood_cache_counter[safe_face_local]++;
+                        
+                        // Remove old cache entries
+                        if (mood_cache_counter[safe_face_local] > MOOD_CACHE_SIZE) {
+                            mood_cache[safe_face_local].erase(mood_cache[safe_face_local].begin());
+                            mood_cache_counter[safe_face_local]--;
+                        }
+                        
+                        // Update debug face for display
+                        if (config.debug_mode && !debug_face_local.empty()) {
+                            debug_face_local.copyTo(debug_face);
+                        }
+                    }
+                }
+                
+                Scalar mood_color = mood_detector.getEmotionColor(mood);
+                
+                #pragma omp critical
+                {
+                    // Display the mood with appropriate color
+                    putText(frame, mood, Point(face.x, face.y - 10),
+                            FONT_HERSHEY_SIMPLEX, 0.7, mood_color, 2);
+                    
+                    // Display confidence
+                    string conf_text = "Conf: " + to_string(int(confidence * 100)) + "%";
+                    putText(frame, conf_text, Point(face.x, face.y + face.height + 20),
+                            FONT_HERSHEY_SIMPLEX, 0.5, mood_color, 1);
+                    
+                    // Show calibration status if active
+                    if (mood_detector.isUsingCalibration()) {
+                        putText(frame, "Calibrated", Point(face.x, face.y - 30),
+                                FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 255, 0), 1);
+                    }
                 }
                 
                 // Save face detection if enabled
@@ -1128,7 +1341,7 @@ int main(int argc, char** argv) {
                                     to_string(face_counter++) + "_" + 
                                     mood + ".jpg";
                     try {
-                        imwrite(filename, face_roi);
+                        imwrite(filename, face_roi_local);
                         if (config.debug_mode) {
                             logger_with_debug.debug("Saved face to: " + filename);
                         }
@@ -1159,8 +1372,35 @@ int main(int argc, char** argv) {
                     FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 255, 0), 2);
         }
         
-        // Display output
-        imshow("Face and Mood Detection", frame);
+        // Optimize display update for RPi
+        if (should_update_display) {
+            // Reduce display update frequency
+            static auto last_display_time = chrono::high_resolution_clock::now();
+            auto now = chrono::high_resolution_clock::now();
+            auto elapsed = chrono::duration_cast<chrono::milliseconds>(now - last_display_time).count();
+            
+            if (elapsed >= 100) {  // Update display every 100ms
+                cv::imshow("Face Mood Detection", frame);
+                last_display_time = now;
+            }
+        }
+        
+        // Cleanup old cache entries periodically
+        cleanup_counter++;
+        if (cleanup_counter >= CLEANUP_INTERVAL) {
+            // Remove entries for faces that haven't been seen recently
+            vector<Rect> faces_to_remove;
+            for (const auto& entry : mood_cache) {
+                if (entry.second.empty()) {
+                    faces_to_remove.push_back(entry.first);
+                }
+            }
+            for (const auto& face : faces_to_remove) {
+                mood_cache.erase(face);
+                mood_cache_counter.erase(face);
+            }
+            cleanup_counter = 0;
+        }
         
         // Handle keyboard input
         int key = waitKey(1);
